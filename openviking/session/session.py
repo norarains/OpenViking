@@ -17,6 +17,7 @@ from openviking.core.namespace import canonical_session_uri
 from openviking.message import Message, Part
 from openviking.message.part import ContextPart, TextPart, ToolPart
 from openviking.server.identity import RequestContext, Role
+from openviking.sparrow_events import emit_sparrow_event
 from openviking.telemetry import get_current_telemetry, tracer
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.time_utils import get_current_timestamp
@@ -585,6 +586,13 @@ class Session:
             f"keep_recent_count={keep_recent_count}"
         )
 
+        emit_sparrow_event(
+            "openviking_commit_starting",
+            session_id=self.session_id,
+            messages=len(self._messages),
+            trace_id=trace_id,
+        )
+
         # ===== Phase 1: Snapshot + clear (PathLock-protected) =====
         # Fast pre-check: skip lock entirely if no messages (common case avoids
         # unnecessary filesystem lock acquisition).
@@ -593,6 +601,14 @@ class Session:
             self._meta.keep_recent_count = keep_recent_count
             await self._save_meta()
             get_current_telemetry().set("memory.extracted", 0)
+            emit_sparrow_event(
+                "openviking_commit_finished",
+                session_id=self.session_id,
+                status="ok",
+                memories=0,
+                files=0,
+                trace_id=trace_id,
+            )
             return {
                 "session_id": self.session_id,
                 "status": "accepted",
@@ -604,6 +620,19 @@ class Session:
 
         blocking_archive = await self._get_blocking_failed_archive_ref()
         if blocking_archive:
+            # Pair the openviking_commit_starting we already fired so a
+            # rejected commit doesn't show up as a dangling start with no
+            # matching finished line in sparrow.log.
+            emit_sparrow_event(
+                "openviking_commit_finished",
+                session_id=self.session_id,
+                status="error",
+                memories=0,
+                files=0,
+                error="BlockedByFailedArchive",
+                blocked_by=blocking_archive.get("archive_id", ""),
+                trace_id=trace_id,
+            )
             raise FailedPreconditionError(
                 f"Session {self.session_id} has unresolved failed archive "
                 f"{blocking_archive['archive_id']}; fix it before committing again.",
@@ -615,20 +644,6 @@ class Session:
         async with LockContext(get_lock_manager(), [session_path], lock_mode="point"):
             # Authoritative check under lock: handles the race where two concurrent
             # callers both passed the pre-check but only the first should archive.
-            if not self._messages:
-                self._meta.pending_tokens = 0
-                self._meta.keep_recent_count = keep_recent_count
-                await self._save_meta()
-                get_current_telemetry().set("memory.extracted", 0)
-                return {
-                    "session_id": self.session_id,
-                    "status": "accepted",
-                    "task_id": None,
-                    "archive_uri": None,
-                    "archived": False,
-                    "trace_id": trace_id,
-                }
-
             # WM v2 boundary: if all live messages already fit inside the keep
             # window, there is nothing to archive — just remember the new
             # keep_recent_count and reset pending_tokens so the next
@@ -640,6 +655,15 @@ class Session:
                 self._meta.message_count = total
                 await self._save_meta()
                 get_current_telemetry().set("memory.extracted", 0)
+                emit_sparrow_event(
+                    "openviking_commit_finished",
+                    session_id=self.session_id,
+                    status="ok",
+                    memories=0,
+                    files=0,
+                    reason="all_within_keep_window",
+                    trace_id=trace_id,
+                )
                 return {
                     "session_id": self.session_id,
                     "status": "accepted",
@@ -676,6 +700,7 @@ class Session:
         archive_uri = (
             f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
         )
+        archive_files_written = 0
         if self._viking_fs:
             lines = [m.to_jsonl() for m in messages_to_archive]
             await self._viking_fs.write_file(
@@ -683,6 +708,7 @@ class Session:
                 content="\n".join(lines) + "\n",
                 ctx=self.ctx,
             )
+            archive_files_written += 1
 
         # WM v2: live session is now the retained tail; pending_tokens resets
         # because anything that was pending has been archived.
@@ -693,7 +719,7 @@ class Session:
 
         self._compression.original_count += len(messages_to_archive)
         logger.info(
-            f"Archived: {len(messages_to_archive)} messages → "
+            f"Archived: {len(messages_to_archive)} messages \u2192 "
             f"history/archive_{self._compression.compression_index:03d}/"
         )
 
@@ -717,6 +743,7 @@ class Session:
                 usage_records=usage_snapshot,
                 first_message_id=messages_to_archive[0].id if messages_to_archive else "",
                 last_message_id=messages_to_archive[-1].id if messages_to_archive else "",
+                files_written=archive_files_written,
             )
         )
 
@@ -737,6 +764,7 @@ class Session:
         usage_records: List["Usage"],
         first_message_id: str,
         last_message_id: str,
+        files_written: int = 0,
     ) -> None:
         """Phase 2: Extract memories, write relations, enqueue — runs in background."""
         import uuid
@@ -750,6 +778,7 @@ class Session:
         request_wait_tracker = get_request_wait_tracker()
 
         memories_extracted: Dict[str, int] = {}
+        memories_written = 0
         active_count_updated = 0
         telemetry = OperationTelemetry(operation="session_commit_phase2", enabled=True)
         archive_index = self._archive_index_from_uri(archive_uri)
@@ -769,10 +798,20 @@ class Session:
                     ),
                     blocked_by=f"archive_{archive_index - 1:03d}",
                 )
+                if self._viking_fs:
+                    files_written += 1
                 tracker.fail(
                     task_id,
                     f"Previous archive archive_{archive_index - 1:03d} failed; "
                     "cannot continue session commit",
+                )
+                emit_sparrow_event(
+                    "openviking_commit_finished",
+                    session_id=self.session_id,
+                    status="error",
+                    memories=0,
+                    files=files_written,
+                    error="PreviousArchiveFailed",
                 )
                 return
 
@@ -827,6 +866,7 @@ class Session:
                             ),
                             ctx=self.ctx,
                         )
+                        files_written += 3
 
                     # Memory extraction — user memory and agent memory run concurrently.
                     if self._session_compressor:
@@ -904,6 +944,42 @@ class Session:
                                     memories_extracted[cat] = memories_extracted.get(cat, 0) + 1
                                 self._stats.memories_extracted += len(agent_extracted)
 
+                            # Sparrow accounting — read compressor stats so
+                            # sparrow_events.openviking_commit_finished surfaces
+                            # accurate memories/files counts.  last_extraction_stats
+                            # is overwritten by whichever extract_* finishes last
+                            # under concurrent gather, so add total extracted as a
+                            # ceiling fallback.
+                            total_extracted = len(extracted) + len(agent_extracted)
+                            extraction_stats = getattr(
+                                self._session_compressor,
+                                "last_extraction_stats",
+                                {},
+                            )
+                            if isinstance(extraction_stats, dict):
+                                memories_written = max(
+                                    int(extraction_stats.get("memories", 0) or 0),
+                                    total_extracted,
+                                )
+                                files_written += max(
+                                    int(extraction_stats.get("files", 0) or 0),
+                                    total_extracted,
+                                )
+                            else:
+                                memories_written = total_extracted
+                                files_written += total_extracted
+
+                        # Synchronously rebuild the vector index for any
+                        # memory URIs that were written or edited this
+                        # turn.  Without this, files land on disk and in
+                        # the kv-store but never enter the searchable
+                        # vector index — the next prefetch keeps hitting
+                        # whatever snapshot was active at server startup.
+                        # Blocking here means commit_finished only fires
+                        # after the new memories are searchable, so the
+                        # next live turn's prefetch sees them.
+                        await self._rebuild_index_for_extracted(extracted)
+
                     # Write relations (using snapshot, not self._usage_records)
                     if self._viking_fs:
                         for usage in usage_records:
@@ -962,6 +1038,8 @@ class Session:
 
             # Write .done file last — signals that all state is finalized
             await self._write_done_file(archive_uri, first_message_id, last_message_id)
+            if self._viking_fs:
+                files_written += 1
 
             tracker.complete(
                 task_id,
@@ -981,6 +1059,13 @@ class Session:
                 },
             )
             logger.info(f"Session {self.session_id} memory extraction completed")
+            emit_sparrow_event(
+                "openviking_commit_finished",
+                session_id=self.session_id,
+                status="ok",
+                memories=memories_written,
+                files=files_written,
+            )
         except Exception as e:
             if redo_enabled and redo_task_id:
                 redo_log.mark_done(redo_task_id)
@@ -989,8 +1074,70 @@ class Session:
                 stage="memory_extraction",
                 error=str(e),
             )
+            if self._viking_fs:
+                files_written += 1
             tracker.fail(task_id, str(e))
             logger.exception(f"Memory extraction failed for session {self.session_id}")
+            emit_sparrow_event(
+                "openviking_commit_finished",
+                session_id=self.session_id,
+                status="error",
+                memories=memories_written,
+                files=files_written,
+                error=type(e).__name__,
+            )
+
+    async def _rebuild_index_for_extracted(self, extracted: List[Any]) -> None:
+        """Rebuild the vector index for memory URIs touched by this
+        commit's extraction pass.
+
+        DESIGN INVARIANT: be careful not to break this.  Extraction writes
+        ``.md`` files and appends embeddings to the kv-store WAL, but the
+        on-disk vector index (``vectordb/.../vector_index/index_flat.data``)
+        is a snapshot that does NOT update incrementally on its own.  Calling
+        ``service.resources.build_index([...])`` re-embeds the listed URIs
+        and promotes a new index version that ``search.find`` will read.
+        Without this call, anything retained mid-session is invisible to
+        semantic search until the next server restart.
+
+        Best-effort: any failure here is logged and swallowed so a transient
+        embedder hiccup never poisons the whole commit (the file is on disk
+        either way; the next commit's reindex will pick it up).
+        """
+        # Deduplicate on URI so a single ctx written then immediately edited
+        # in the same pass produces one reindex job instead of two.
+        uris = []
+        seen: set = set()
+        for ctx_item in extracted or ():
+            uri = getattr(ctx_item, "uri", None)
+            if not uri or uri in seen:
+                continue
+            seen.add(uri)
+            uris.append(uri)
+        if not uris:
+            return
+
+        try:
+            from openviking.server.dependencies import get_service
+            service = get_service()
+        except Exception as exc:
+            logger.warning("post-extract reindex skipped: service unavailable (%s)", exc)
+            return
+
+        try:
+            await service.resources.build_index(uris, ctx=self.ctx)
+            logger.info(
+                "post-extract reindex: %d URI(s) re-embedded into vector index",
+                len(uris),
+            )
+        except Exception as exc:
+            # File is already on disk and in the WAL; a future commit's
+            # reindex will pick it up.  Don't fail the whole commit on a
+            # transient embedder error.
+            logger.warning(
+                "post-extract reindex failed for %d URI(s): %s",
+                len(uris), exc,
+            )
 
     async def _write_done_file(
         self,

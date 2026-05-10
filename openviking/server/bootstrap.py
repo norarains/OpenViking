@@ -287,7 +287,22 @@ def main():
                 log_config=None,
             )
         else:
-            uvicorn.run(app, host=config.host, port=config.port, log_config=None)
+            # ``timeout_graceful_shutdown=5`` caps uvicorn's "wait for
+            # connections to close" phase at 5 seconds.  Without it,
+            # uvicorn defaults to ``None`` which means "wait forever",
+            # and a parent process that holds an open keepalive
+            # connection can deadlock the server's SIGTERM handling
+            # until the parent's own kill timer fires SIGKILL — which
+            # can corrupt versioned vector-index snapshots if a
+            # post-extract reindex was mid-write.  Five seconds is
+            # plenty for in-flight requests to actually finish on
+            # localhost; idle keepalive-only connections are dropped
+            # after the cap.
+            uvicorn.run(
+                app, host=config.host, port=config.port,
+                log_config=None,
+                timeout_graceful_shutdown=5,
+            )
     finally:
         # Cleanup vikingbot process on shutdown
         if bot_process is not None:

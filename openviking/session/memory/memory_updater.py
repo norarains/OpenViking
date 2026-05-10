@@ -271,6 +271,7 @@ class MemoryUpdater:
         self._registry = registry
         self._vikingdb = vikingdb
         self._transaction_handle = transaction_handle
+        self.last_overview_write_count = 0
 
     def set_registry(self, registry: MemoryTypeRegistry) -> None:
         """Set the memory type registry for URI resolution."""
@@ -292,6 +293,7 @@ class MemoryUpdater:
     ) -> MemoryUpdateResult:
 
         result = MemoryUpdateResult()
+        self.last_overview_write_count = 0
         viking_fs = self._get_viking_fs()
 
         if not viking_fs:
@@ -622,5 +624,6 @@ class MemoryUpdater:
         try:
             await viking_fs.write_file(overview_path, rendered, ctx=ctx)
             tracer.info(f"[generate_overview] Generated overview: {overview_path}")
+            self.last_overview_write_count += 1
         except Exception as e:
             logger.error(f"Failed to write overview {overview_path}: {e}")

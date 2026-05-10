@@ -215,7 +215,10 @@ class OpenAIVLM(VLMBase):
             "messages": kwargs_messages,
         }
         if is_reasoning:
-            kwargs["reasoning_effort"] = self.reasoning_effort
+            if tools and (model or "").lower() == "gpt-5.4-mini":
+                logger.warning("Dropping reasoning_effort: chat.completions rejects it with tools for gpt-5.4-mini")
+            else:
+                kwargs["reasoning_effort"] = self.reasoning_effort
         else:
             kwargs["temperature"] = self.temperature
         self._apply_provider_specific_extra_body(kwargs, thinking)

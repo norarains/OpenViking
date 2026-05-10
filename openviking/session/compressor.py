@@ -70,6 +70,7 @@ class SessionCompressor:
         self.extractor = MemoryExtractor()
         self.deduplicator = MemoryDeduplicator(vikingdb=vikingdb)
         self._pending_semantic_changes: Dict[str, Dict[str, set]] = {}
+        self.last_extraction_stats: Dict[str, int] = {"memories": 0, "files": 0}
 
     def _record_semantic_change(
         self, file_uri: str, change_type: str, parent_uri: Optional[str] = None
@@ -309,6 +310,7 @@ class SessionCompressor:
         archive_uri: str = "",
     ) -> List[Context]:
         """Extract long-term memories from messages."""
+        self.last_extraction_stats = {"memories": 0, "files": 0}
         if not messages:
             return []
 
@@ -564,6 +566,15 @@ class SessionCompressor:
                     f"Memory extraction: created={stats.created}, "
                     f"merged={stats.merged}, deleted={stats.deleted}, skipped={stats.skipped}"
                 )
+                memory_ops = stats.created + stats.merged + stats.deleted
+                self.last_extraction_stats = {
+                    "memories": memory_ops,
+                    "files": memory_ops,
+                    "created": stats.created,
+                    "merged": stats.merged,
+                    "deleted": stats.deleted,
+                    "skipped": stats.skipped,
+                }
                 return memories
 
             except Exception:

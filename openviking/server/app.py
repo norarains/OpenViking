@@ -164,6 +164,13 @@ def create_app(
         """Run heavy initialization in background after server starts accepting requests."""
         await service.initialize()
 
+        # Sweep archives that the previous server left without a terminal
+        # marker; otherwise the next commit deadlocks in
+        # _wait_for_previous_archive_done's `while True` loop.
+        from openviking.session.orphan_recovery import recover_orphan_archives
+        from openviking_cli.utils.config import get_openviking_config
+        recover_orphan_archives(get_openviking_config().storage.workspace)
+
         # Initialize APIKeyManager after service (needs VikingFS)
         effective_auth_mode = config.get_effective_auth_mode()
         if config.root_api_key and config.root_api_key != "":

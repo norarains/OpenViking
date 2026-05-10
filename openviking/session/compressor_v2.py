@@ -88,6 +88,10 @@ class SessionCompressorV2:
     ):
         """Initialize session compressor."""
         self.vikingdb = vikingdb
+        # Sparrow stats — read by session.py to surface per-commit numbers
+        # in sparrow_events.openviking_commit_finished.
+        self.last_extraction_stats: Dict[str, int] = {"memories": 0, "files": 0}
+        self._last_memory_diff_write_count = 0
         pass
 
     def _get_or_create_react(
@@ -165,14 +169,17 @@ class SessionCompressorV2:
         """
 
         if not messages:
+            self.last_extraction_stats = {"memories": 0, "files": 0}
             return []
 
         if not ctx:
             logger.warning("No RequestContext provided, skipping memory extraction")
+            self.last_extraction_stats = {"memories": 0, "files": 0}
             return []
 
         tracer.info("Starting v2 memory extraction from conversation")
         tracer.info(f"messages={JsonUtils.dumps(messages)}")
+        self.last_extraction_stats = {"memories": 0, "files": 0}
         config = get_openviking_config()
 
         # Initialize default memory files (soul.md, identity.md) if not exist
@@ -300,7 +307,15 @@ class SessionCompressorV2:
                 f"errors={len(result.errors)}"
             )
 
-            # Write memory_diff.json to archive directory
+            # Sparrow needs the same op count for last_extraction_stats below.
+            memory_ops = (
+                len(result.written_uris)
+                + len(result.edited_uris)
+                + len(result.deleted_uris)
+            )
+
+            # Write memory_diff.json to archive directory (upstream inline pattern)
+            self._last_memory_diff_write_count = 0
             if archive_uri and viking_fs:
                 memory_diff = await self._build_memory_diff(
                     result=result,
@@ -315,6 +330,7 @@ class SessionCompressorV2:
                     ctx=ctx,
                 )
                 logger.info(f"Wrote memory_diff.json to {archive_uri}")
+                self._last_memory_diff_write_count = 1
 
             # Report telemetry stats (matching v1 pattern)
             telemetry = get_current_telemetry()
@@ -326,6 +342,22 @@ class SessionCompressorV2:
             telemetry.set("memory.extract.merged", len(result.edited_uris))
             telemetry.set("memory.extract.deleted", len(result.deleted_uris))
             telemetry.set("memory.extract.skipped", len(result.errors))
+
+            # Sparrow stats accumulation — diff write already handled inline above.
+            diff_written = self._last_memory_diff_write_count
+            overview_writes = updater.last_overview_write_count
+
+            self.last_extraction_stats = {
+                "memories": memory_ops,
+                "files": memory_ops + overview_writes + diff_written,
+                "written": len(result.written_uris),
+                "edited": len(result.edited_uris),
+                "deleted": len(result.deleted_uris),
+                "overviews": overview_writes,
+                "diffs": diff_written,
+                "errors": len(result.errors),
+            }
+
 
             # Build Context objects for stats in session.py
             contexts: List[Context] = []

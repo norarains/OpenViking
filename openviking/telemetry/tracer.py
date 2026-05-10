@@ -8,7 +8,25 @@ import json
 import logging
 from typing import Any, Callable, Optional
 
-from loguru import logger
+from loguru import logger as loguru_logger
+
+
+class _LazyOpenVikingLogger:
+    """Resolve OpenViking's configured logger after import-time cycles settle."""
+
+    def _resolve(self) -> logging.Logger:
+        try:
+            from openviking_cli.utils.logger import get_logger
+
+            return get_logger(__name__)
+        except Exception:
+            return logging.getLogger(__name__)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolve(), name)
+
+
+logger = _LazyOpenVikingLogger()
 
 # Try to import opentelemetry - will be None if not installed
 try:
@@ -78,7 +96,7 @@ def _setup_logging():
 
     try:
         # Configure logger to patch records with trace_id
-        logger.configure(
+        loguru_logger.configure(
             patcher=lambda record: record.__setitem__(
                 "extra", {**record["extra"], "trace_id": get_trace_id()}
             )
